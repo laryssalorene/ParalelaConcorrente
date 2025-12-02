@@ -6,6 +6,7 @@ import time
 import io
 import numpy as np
 import matplotlib
+import os
 # Backend 'Agg' para gerar gráficos sem GUI
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -42,18 +43,21 @@ def recvall(sock, n):
 # =============================================================================
 
 def perform_matrix_op(m_size):
-    """Gera matrizes e calcula. Usada para Serial e Thread."""
+    """
+    Gera matrizes e calcula.
+    Retorna apenas o shape para evitar overhead de I/O desnecessário.
+    """
     # Recria seed para garantir aleatoriedade em threads/processos distintos
     np.random.seed() 
     mat_a = np.random.rand(m_size, m_size)
     mat_b = np.random.rand(m_size, m_size)
     
-    t_start = time.time()
-    np.dot(mat_a, mat_b)
-    t_end = time.time()
-    return t_end - t_start
+    # Realiza a multiplicação (CPU-bound)
+    res = np.dot(mat_a, mat_b)
+    
+    return res.shape
 
-# Wrapper para o ProcessPool (deve ser top-level)
+# Wrapper para o ProcessPool (deve ser top-level para pickle funcionar)
 def task_process_heavy(m_size):
     return perform_matrix_op(m_size)
 
@@ -63,41 +67,41 @@ def task_process_heavy(m_size):
 
 def generate_table_str(t_serial, t_thread, t_process):
     """Gera a tabela formatada exatamente como solicitado."""
-    # Calcula Speedups (Base: Serial)
-    # Se tempo for muito pequeno (0), evita divisão por zero
     s_serial = 1.0
-    s_thread = t_serial / t_thread if t_thread > 0 else 0
-    s_process = t_serial / t_process if t_process > 0 else 0
+    # Evita divisão por zero ou números infinitos
+    s_thread = t_serial / t_thread if t_thread > 1e-9 else 1.0
+    s_process = t_serial / t_process if t_process > 1e-9 else 1.0
 
     table = (
         "===== RESULTADO =====\n"
         f"{'':<18} {'Tempo(s)':<14} {'SpeedUp':<10}\n"
-        f"{'SERIAL':<16} {t_serial:.10f}s      {s_serial:.10f}\n"
-        f"{'CONCORRÊNCIA':<16} {t_thread:.10f}s      {s_thread:.10f}\n"
-        f"{'PARALELISMO':<16} {t_process:.10f}s      {s_process:.10f}\n"
+        f"{'SERIAL':<16} {t_serial:.6f}s      {s_serial:.4f}\n"
+        f"{'CONCORRÊNCIA':<16} {t_thread:.6f}s      {s_thread:.4f}\n"
+        f"{'PARALELISMO':<16} {t_process:.6f}s      {s_process:.4f}\n"
         "====================="
     )
     return table
 
 def generate_single_plot(m_size, times):
     """Gráfico de barras para uma única execução (Opção 1)."""
-    labels = ['Serial', 'Concorrência', 'Paralelismo']
+    labels = ['SERIAL', 'CONCORRÊNCIA', 'PARALELISMO']
     colors = ['#3498db', '#f1c40f', '#e74c3c'] # Azul, Amarelo, Vermelho
     
-    fig, ax = plt.subplots(figsize=(7, 5))
+    fig, ax = plt.subplots(figsize=(8, 6))
     bars = ax.bar(labels, times, color=colors)
     
-    ax.set_ylabel('Tempo (s)')
+    ax.set_ylabel('Tempo Médio (s)')
     ax.set_title(f'Desempenho: Matriz {m_size}x{m_size}')
+    ax.grid(True, axis='y', linestyle='--', alpha=0.7)
     
     # Adiciona valores no topo das barras
     for bar in bars:
         height = bar.get_height()
         ax.annotate(f'{height:.4f}s',
                     xy=(bar.get_x() + bar.get_width() / 2, height),
-                    xytext=(0, 3),  # 3 points vertical offset
+                    xytext=(0, 3),
                     textcoords="offset points",
-                    ha='center', va='bottom')
+                    ha='center', va='bottom', fontweight='bold')
 
     buf = io.BytesIO()
     plt.savefig(buf, format='png')
@@ -119,17 +123,17 @@ def generate_consolidated_plot(history):
     t_thread = [h[2] for h in history]
     t_process = [h[3] for h in history]
 
-    x = np.arange(len(sizes))  # Label locations
-    width = 0.25  # Largura das barras
+    x = np.arange(len(sizes))
+    width = 0.25
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    rects1 = ax.bar(x - width, t_serial, width, label='Serial', color='#3498db')
-    rects2 = ax.bar(x, t_thread, width, label='Concorrência', color='#f1c40f')
-    rects3 = ax.bar(x + width, t_process, width, label='Paralelismo', color='#e74c3c')
+    rects1 = ax.bar(x - width, t_serial, width, label='SERIAL', color='#3498db')
+    rects2 = ax.bar(x, t_thread, width, label='CONCORRÊNCIA', color='#f1c40f')
+    rects3 = ax.bar(x + width, t_process, width, label='PARALELISMO', color='#e74c3c')
 
     ax.set_xlabel('Tamanho da Matriz (NxN)')
     ax.set_ylabel('Tempo (s)')
-    ax.set_title('Análise Consolidada de Desempenho')
+    ax.set_title('Análise Consolidada (Overhead visível em N pequeno)')
     ax.set_xticks(x)
     ax.set_xticklabels(sizes)
     ax.legend()
@@ -149,9 +153,51 @@ def generate_consolidated_plot(history):
 HOST = '0.0.0.0'
 PORT = 5000
 
-# Histórico: Lista de tuplas (size, t_serial, t_thread, t_process)
 HISTORY = []
 HISTORY_LOCK = threading.Lock()
+
+def warm_up_system(cpu_pool, thread_pool):
+    """
+    Executa cálculos descartáveis para carregar bibliotecas,
+    iniciar processos e 'aquecer' o sistema.
+    """
+    print("[INIT] Aquecendo motores (Warm-up)...")
+    dummy_size = 100
+    
+    # Serial Warmup
+    perform_matrix_op(dummy_size)
+    
+    # Thread Warmup
+    thread_pool.submit(perform_matrix_op, dummy_size).result()
+    
+    # Process Warmup
+    cpu_pool.submit(task_process_heavy, dummy_size).result()
+    print("[INIT] Sistema aquecido e pronto.")
+
+def measure_execution(executor, func, m_size, mode='serial'):
+    """
+    Executa a função múltiplas vezes para N pequeno e tira a média.
+    Para N grande, executa apenas uma vez.
+    Isso suaviza o jitter do SO.
+    """
+    # Se a matriz é pequena (< 300), rodamos mais vezes para ter precisão
+    # Se é grande, 1 vez basta (pois demora segundos)
+    runs = 5 if m_size < 300 else 1
+    total_time = 0.0
+
+    for _ in range(runs):
+        t0 = time.time()
+        
+        if mode == 'serial':
+            func(m_size)
+        else:
+            # executor é thread_pool ou cpu_pool
+            future = executor.submit(func, m_size)
+            future.result() # Bloqueia para garantir que terminou
+            
+        total_time += (time.time() - t0)
+
+    return total_time / runs
 
 def handle_client(conn, addr, cpu_pool, thread_pool):
     print(f"[CONEXÃO] {addr} conectado.")
@@ -165,27 +211,27 @@ def handle_client(conn, addr, cpu_pool, thread_pool):
 
             if req['acao'] == '1':
                 m_size = req['valor']
-                print(f"[*] Iniciando cálculos para Matriz {m_size}...")
+                print(f"[*] Matriz {m_size}: Calculando...")
                 
-                # 1. Serial (Rodar localmente ou via pool, mas sequencial)
-                t_serial = perform_matrix_op(m_size)
+                # --- MEDIÇÃO COM MÉDIA E SUAVIZAÇÃO ---
                 
-                # 2. Concorrência (ThreadPool)
-                future_thread = thread_pool.submit(perform_matrix_op, m_size)
-                t_thread = future_thread.result()
+                # 1. Serial
+                t_serial = measure_execution(None, perform_matrix_op, m_size, mode='serial')
                 
-                # 3. Paralelismo (ProcessPool)
-                future_process = cpu_pool.submit(task_process_heavy, m_size)
-                t_process = future_process.result()
+                # 2. Concorrência
+                t_thread = measure_execution(thread_pool, perform_matrix_op, m_size, mode='pool')
+                
+                # 3. Paralelismo
+                t_process = measure_execution(cpu_pool, task_process_heavy, m_size, mode='pool')
+
+                print(f"    -> Resultados (Média): S={t_serial:.5f}s | T={t_thread:.5f}s | P={t_process:.5f}s")
 
                 # Salvar Histórico
                 with HISTORY_LOCK:
                     HISTORY.append((m_size, t_serial, t_thread, t_process))
 
-                # Gerar Tabela Texto
+                # Gerar Respostas
                 txt_tabela = generate_table_str(t_serial, t_thread, t_process)
-                
-                # Gerar Gráfico Único
                 img_bytes = generate_single_plot(m_size, [t_serial, t_thread, t_process])
 
                 response = {'tabela': txt_tabela, 'imagem': img_bytes}
@@ -195,10 +241,8 @@ def handle_client(conn, addr, cpu_pool, thread_pool):
                 with HISTORY_LOCK:
                     data_snapshot = list(HISTORY)
                 
-                # Gera gráfico clusterizado
                 img_bytes = generate_consolidated_plot(data_snapshot)
                 
-                # Gera tabela texto consolidada (Resumo)
                 txt_head = "===== HISTÓRICO CONSOLIDADO =====\n"
                 txt_head += f"{'Size':<8} {'Serial(s)':<12} {'Conc(s)':<12} {'Paral(s)':<12}\n"
                 txt_body = ""
@@ -221,10 +265,11 @@ def main():
     max_workers = multiprocessing.cpu_count()
     print(f"[INIT] Servidor com {max_workers} núcleos.")
 
-    # ProcessPool para Paralelismo (CPU-Bound real)
-    # ThreadPool para Concorrência (Simulação de I/O bound ou teste de GIL)
     with ProcessPoolExecutor(max_workers=max_workers) as proc_executor:
         with ThreadPoolExecutor(max_workers=max_workers) as thread_executor:
+            
+            # --- FASE DE AQUECIMENTO ---
+            warm_up_system(proc_executor, thread_executor)
             
             server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -235,7 +280,6 @@ def main():
             try:
                 while True:
                     conn, addr = server.accept()
-                    # Cria thread para gerenciar a conexão, passando os pools
                     t = threading.Thread(
                         target=handle_client, 
                         args=(conn, addr, proc_executor, thread_executor)
