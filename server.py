@@ -1,9 +1,9 @@
 import os
 
-# --- CONFIGURAÇÃO DE AMBIENTE ---
+# --- CONFIGURAÇÃO DE AMBIENTE (CRÍTICO) ---
 # Força o Numpy a usar apenas 1 thread por operação.
 # Isso garante que o modo SERIAL seja puramente single-core (lento),
-# permitindo que nossa paralelização manual brilhe.
+# permitindo que o paralelismo via Processos (Foster) mostre seu valor.
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -51,41 +51,37 @@ def recvall(sock, n):
     return data
 
 # =============================================================================
-# LÓGICA DE MATRIZES COM MEMÓRIA COMPARTILHADA
+# WORKER: A UNIDADE DE CÁLCULO
 # =============================================================================
 
 def worker_chunk_calc(shm_names, shape, start_row, end_row, dtype):
     """
-    Função Worker: Calcula apenas uma fatia (chunk) da matriz resultante.
-    Lê de A e B na memória compartilhada, escreve em C na memória compartilhada.
+    Worker agnóstico: Pode ser executado por uma Thread ou por um Processo.
+    1. Conecta à memória compartilhada (Zero-Copy).
+    2. Calcula a fatia designada (Chunk).
     """
     # 1. Conectar à memória compartilhada existente
-    existing_shm_a = shared_memory.SharedMemory(name=shm_names['A'])
-    existing_shm_b = shared_memory.SharedMemory(name=shm_names['B'])
-    # Nota: Em um cenário real, escreveríamos em C. Para benchmark de tempo,
-    # podemos apenas calcular para evitar overhead de alocação de C se não formos usar.
-    # Mas para ser justo, vamos calcular A_chunk @ B.
-    
-    # 2. Reconstruir arrays numpy a partir do buffer (Zero-Copy)
-    mat_a = np.ndarray(shape, dtype=dtype, buffer=existing_shm_a.buf)
-    mat_b = np.ndarray(shape, dtype=dtype, buffer=existing_shm_b.buf)
-    
-    # 3. Cálculo da Fatia: A[start:end] x B
-    # O resultado é uma matriz (end-start) x M.
-    # Como não precisamos retornar o valor para o cliente, apenas calculamos.
-    _res_chunk = np.dot(mat_a[start_row:end_row, :], mat_b)
-    
-    # 4. Fechar acesso (não destrói a memória, apenas desconecta)
-    existing_shm_a.close()
-    existing_shm_b.close()
+    try:
+        existing_shm_a = shared_memory.SharedMemory(name=shm_names['A'])
+        existing_shm_b = shared_memory.SharedMemory(name=shm_names['B'])
+        
+        # 2. Reconstruir arrays numpy a partir do buffer
+        mat_a = np.ndarray(shape, dtype=dtype, buffer=existing_shm_a.buf)
+        mat_b = np.ndarray(shape, dtype=dtype, buffer=existing_shm_b.buf)
+        
+        # 3. Cálculo da Fatia (Tarefa Aglomerada)
+        _res_chunk = np.dot(mat_a[start_row:end_row, :], mat_b)
+        
+        # 4. Fechar acesso
+        existing_shm_a.close()
+        existing_shm_b.close()
+    except Exception as e:
+        print(f"Erro no worker: {e}")
+        return 0
     
     return (end_row - start_row)
 
-# Wrapper para Serial (executa tudo de uma vez)
-def serial_full_calc(shm_names, shape, dtype):
-    return worker_chunk_calc(shm_names, shape, 0, shape[0], dtype)
-
-# Wrapper para Pickle (necessário para ProcessPool)
+# Wrapper para serialização no ProcessPool
 def task_wrapper(args):
     return worker_chunk_calc(*args)
 
@@ -95,59 +91,73 @@ class MatrixManager:
         self.size = size
         self.shape = (size, size)
         self.dtype = np.float64
-        self.nbytes = int(size * size * 8) # 8 bytes float64
+        self.nbytes = int(size * size * 8)
         self.shm_a = None
         self.shm_b = None
 
     def allocate(self):
-        # Cria blocos de memória
         self.shm_a = shared_memory.SharedMemory(create=True, size=self.nbytes)
         self.shm_b = shared_memory.SharedMemory(create=True, size=self.nbytes)
-        
-        # Cria arrays numpy mapeados nessa memória
         arr_a = np.ndarray(self.shape, dtype=self.dtype, buffer=self.shm_a.buf)
         arr_b = np.ndarray(self.shape, dtype=self.dtype, buffer=self.shm_b.buf)
-        
-        # Popula com dados aleatórios
         arr_a[:] = np.random.rand(*self.shape)
         arr_b[:] = np.random.rand(*self.shape)
-        
         return {'A': self.shm_a.name, 'B': self.shm_b.name}
 
     def cleanup(self):
         if self.shm_a:
             self.shm_a.close()
-            self.shm_a.unlink() # Destrói
+            self.shm_a.unlink()
         if self.shm_b:
             self.shm_b.close()
-            self.shm_b.unlink() # Destrói
+            self.shm_b.unlink()
 
 # =============================================================================
-# GERENCIAMENTO DE EXECUÇÃO
+# MÉTODOS DE CÁLCULO (SERIAL, CONCORRENTE, PARALELO)
 # =============================================================================
 
-def execute_parallel_strategy(executor, m_size, shm_names, num_workers):
+def algorithm_serial(shm_names, shape, dtype):
     """
-    Estratégia Paralela/Concorrente:
-    Divide a matriz em N fatias horizontais e manda cada worker calcular uma.
+    MÉTODO 1: SERIAL
+    Executa o cálculo inteiro em um único núcleo (Main Thread).
+    Não há particionamento nem overhead de gerenciamento de tarefas.
     """
+    return worker_chunk_calc(shm_names, shape, 0, shape[0], dtype)
+
+def _distribute_tasks_foster(executor, m_size, shm_names, num_workers):
+    """Lógica interna de distribuição Foster (PCAM) usada por Concorrente e Paralelo."""
+    # Aglomeração: Define o tamanho do bloco
     rows_per_chunk = m_size // num_workers
     futures = []
     
+    # Mapeamento: Distribui blocos para workers
     for i in range(num_workers):
         start = i * rows_per_chunk
-        # O último worker pega o resto (se a divisão não for exata)
         end = m_size if i == num_workers - 1 else (i + 1) * rows_per_chunk
-        
-        # Argumentos para o worker
         args = (shm_names, (m_size, m_size), start, end, np.float64)
-        
-        # Envia tarefa
         futures.append(executor.submit(task_wrapper, args))
     
-    # Espera todos terminarem
+    # Sincronização
     for f in futures:
         f.result()
+
+def algorithm_concurrent(thread_pool, m_size, shm_names, num_workers):
+    """
+    MÉTODO 2: PURAMENTE CONCORRENTE
+    Usa Threads. No Python, threads compartilham o GIL.
+    Ideal para I/O, mas em CPU-bound sofrem contenção.
+    Aqui aplicamos Foster para dividir a carga entre threads.
+    """
+    _distribute_tasks_foster(thread_pool, m_size, shm_names, num_workers)
+
+def algorithm_parallel(process_pool, m_size, shm_names, num_workers):
+    """
+    MÉTODO 3: PARALELO (FOSTER + SHARED MEMORY)
+    Usa Processos Independentes (ProcessPoolExecutor).
+    Cada processo tem seu próprio GIL e roda em um núcleo físico diferente.
+    Usa Memória Compartilhada para evitar cópia de dados (Zero-Copy).
+    """
+    _distribute_tasks_foster(process_pool, m_size, shm_names, num_workers)
 
 # =============================================================================
 # GRÁFICOS E TABELAS
@@ -212,7 +222,7 @@ def generate_consolidated_plot(history):
 
     ax.set_xlabel('Tamanho da Matriz (NxN)')
     ax.set_ylabel('Tempo (s)')
-    ax.set_title('Análise Consolidada (Serial Single-Core vs Multi-Core)')
+    ax.set_title('Análise Consolidada (Serial vs Concorrente vs Paralelo)')
     ax.set_xticks(x)
     ax.set_xticklabels(sizes)
     ax.legend()
@@ -247,39 +257,34 @@ def handle_client(conn, addr, cpu_pool, thread_pool, num_cores):
 
             if req['acao'] == '1':
                 m_size = req['valor']
-                print(f"[*] Matriz {m_size}: Preparando Shared Memory...")
+                print(f"[*] Matriz {m_size}: Iniciando Benchmark...")
                 
-                # Gerenciador de memória (Aloca A e B uma vez)
                 mgr = MatrixManager(m_size)
                 shm_names = {}
                 
                 try:
-                    # 1. Alocação e Geração de Dados (custo fixo, não medido no benchmark)
                     shm_names = mgr.allocate()
-                    print(f"    -> Memória alocada ({mgr.nbytes/1024/1024:.1f} MB). Iniciando cálculos.")
+                    print(f"    -> Dados alocados. Executando métodos...")
 
-                    # --- SERIAL (1 Núcleo) ---
+                    # 1. SERIAL
                     t0 = time.time()
-                    serial_full_calc(shm_names, mgr.shape, mgr.dtype)
+                    algorithm_serial(shm_names, mgr.shape, mgr.dtype)
                     t_serial = time.time() - t0
                     
-                    # --- CONCORRÊNCIA (N Threads) ---
-                    # Numpy libera GIL, então threads funcionam bem aqui
+                    # 2. CONCORRENTE
                     t0 = time.time()
-                    execute_parallel_strategy(thread_pool, m_size, shm_names, num_cores)
+                    algorithm_concurrent(thread_pool, m_size, shm_names, num_cores)
                     t_thread = time.time() - t0
                     
-                    # --- PARALELISMO (N Processos) ---
-                    # Usa Shared Memory para evitar IPC overhead
+                    # 3. PARALELO (O foco da questão)
                     t0 = time.time()
-                    execute_parallel_strategy(cpu_pool, m_size, shm_names, num_cores)
+                    algorithm_parallel(cpu_pool, m_size, shm_names, num_cores)
                     t_process = time.time() - t0
 
                 except Exception as e:
                     print(f"Erro no cálculo: {e}")
                     t_serial, t_thread, t_process = 0, 0, 0
                 finally:
-                    # Sempre limpar a memória compartilhada
                     mgr.cleanup()
                 
                 print(f"    -> S={t_serial:.4f}s | T={t_thread:.4f}s | P={t_process:.4f}s")
@@ -297,10 +302,15 @@ def handle_client(conn, addr, cpu_pool, thread_pool, num_cores):
                 img = generate_consolidated_plot(data)
                 
                 txt_head = "===== HISTÓRICO CONSOLIDADO =====\n"
-                txt_head += f"{'Size':<8} {'Serial(s)':<12} {'Conc(s)':<12} {'Paral(s)':<12}\n"
+                txt_head += f"{'Size':<8} {'Serial(s)':<10} {'Conc(s)':<10} {'Paral(s)':<10} {'SpeedUp(C)':<12} {'SpeedUp(P)':<12}\n"
                 txt_body = ""
                 for item in data:
-                    txt_body += f"{item[0]:<8} {item[1]:.4f}       {item[2]:.4f}       {item[3]:.4f}\n"
+                    size, t_s, t_c, t_p = item
+                    # Calcula SpeedUps relativos ao Serial
+                    sp_c = t_s / t_c if t_c > 1e-9 else 0.0
+                    sp_p = t_s / t_p if t_p > 1e-9 else 0.0
+                    
+                    txt_body += f"{size:<8} {t_s:<10.4f} {t_c:<10.4f} {t_p:<10.4f} {sp_c:<12.4f} {sp_p:<12.4f}\n"
                 txt_body += "================================="
                 response = {'tabela': txt_head + txt_body, 'imagem': img}
 
@@ -308,26 +318,23 @@ def handle_client(conn, addr, cpu_pool, thread_pool, num_cores):
 
     except Exception as e:
         print(f"[ERRO] {addr}: {e}")
-        import traceback
-        traceback.print_exc()
     finally:
         conn.close()
 
 def main():
     num_cores = multiprocessing.cpu_count()
     print(f"[INIT] Servidor com {num_cores} núcleos.")
-    print("[INIT] Modo OTIMIZADO: Serial=1 Core, Paralelo=Shared Memory + Chunks.")
+    print("[INIT] Métodos carregados: Serial, Concorrente e Paralelo (Foster).")
 
-    # Inicia pools
     with ProcessPoolExecutor(max_workers=num_cores) as proc_executor:
         with ThreadPoolExecutor(max_workers=num_cores) as thread_executor:
             
-            # Warm-up rápido para garantir carregamento de libs
-            print("[INIT] Warm-up...")
+            # Warm-up
+            print("[INIT] Executando Warm-up...")
             try:
                 mgr = MatrixManager(100)
                 names = mgr.allocate()
-                execute_parallel_strategy(proc_executor, 100, names, num_cores)
+                algorithm_parallel(proc_executor, 100, names, num_cores)
                 mgr.cleanup()
             except: pass
             
