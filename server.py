@@ -1,7 +1,6 @@
 import os
 
 # --- CONFIGURAÇÃO DE AMBIENTE (CRÍTICO) ---
-# Força o Numpy a usar apenas 1 thread por operação.
 # Isso garante que o modo SERIAL seja puramente single-core (lento),
 # permitindo que o paralelismo via Processos (Foster) mostre seu valor.
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -61,18 +60,23 @@ def worker_chunk_calc(shm_names, shape, start_row, end_row, dtype):
     2. Calcula a fatia designada (Chunk).
     """
     # 1. Conectar à memória compartilhada existente
+    # O GIL é OBRIGATÓRIO aqui. Apenas 1 thread roda por vez
     try:
         existing_shm_a = shared_memory.SharedMemory(name=shm_names['A'])
         existing_shm_b = shared_memory.SharedMemory(name=shm_names['B'])
         
         # 2. Reconstruir arrays numpy a partir do buffer
+        # Aqui, o Python está criando os objetos wrappers (np.ndarray).
+        # O GIL ainda é obrigatório.
         mat_a = np.ndarray(shape, dtype=dtype, buffer=existing_shm_a.buf)
         mat_b = np.ndarray(shape, dtype=dtype, buffer=existing_shm_b.buf)
         
         # 3. Cálculo da Fatia (Tarefa Aglomerada)
+
         _res_chunk = np.dot(mat_a[start_row:end_row, :], mat_b)
         
         # 4. Fechar acesso
+        # O Python retomou o controle. O GIL está preso novamente.
         existing_shm_a.close()
         existing_shm_b.close()
     except Exception as e:
@@ -83,6 +87,7 @@ def worker_chunk_calc(shm_names, shape, start_row, end_row, dtype):
 
 # Wrapper para serialização no ProcessPool
 def task_wrapper(args):
+    #3. desempacotamento e execução
     return worker_chunk_calc(*args)
 
 class MatrixManager:
@@ -134,7 +139,9 @@ def _distribute_tasks_foster(executor, m_size, shm_names, num_workers):
     for i in range(num_workers):
         start = i * rows_per_chunk
         end = m_size if i == num_workers - 1 else (i + 1) * rows_per_chunk
+        #1.empacotamento
         args = (shm_names, (m_size, m_size), start, end, np.float64)
+        #2envio
         futures.append(executor.submit(task_wrapper, args))
     
     # Sincronização
@@ -172,14 +179,14 @@ def generate_table_str(t_serial, t_thread, t_process):
         "===== RESULTADO =====\n"
         f"{'':<18} {'Tempo(s)':<14} {'SpeedUp':<10}\n"
         f"{'SERIAL':<16} {t_serial:.6f}s      {s_serial:.4f}\n"
-        f"{'CONCORRÊNCIA':<16} {t_thread:.6f}s      {s_thread:.4f}\n"
-        f"{'PARALELISMO':<16} {t_process:.6f}s      {s_process:.4f}\n"
+        f"{'PARAL. C/ THREADS':<16} {t_thread:.6f}s      {s_thread:.4f}\n"
+        f"{'PARAL. C/ NÚCLEOS':<16} {t_process:.6f}s      {s_process:.4f}\n"
         "====================="
     )
     return table
 
 def generate_single_plot(m_size, times):
-    labels = ['SERIAL', 'CONCORRÊNCIA', 'PARALELISMO']
+    labels = ['SERIAL', 'PARAL. C/ THREADS', 'PARAL. C/ NÚCLEOS']
     colors = ['#3498db', '#f1c40f', '#e74c3c'] 
     
     fig, ax = plt.subplots(figsize=(8, 6))
@@ -217,7 +224,7 @@ def generate_consolidated_plot(history):
 
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.bar(x - width, t_serial, width, label='SERIAL', color='#3498db')
-    ax.bar(x, t_thread, width, label='CONCORRÊNCIA', color='#f1c40f')
+    ax.bar(x, t_thread, width, label='PARAL. C/ THREADS', color='#f1c40f')
     ax.bar(x + width, t_process, width, label='PARALELISMO', color='#e74c3c')
 
     ax.set_xlabel('Tamanho da Matriz (NxN)')
